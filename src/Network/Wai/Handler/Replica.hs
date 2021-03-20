@@ -110,7 +110,7 @@ app :: forall st.
   -> ConnectionOptions
   -> Middleware
   -> st
-  -> (Context -> st -> IO (V.HTML, Event -> Maybe (IO ()), IO (Maybe st)))
+  -> (Context -> st -> IO (Maybe (V.HTML, st, Event -> Maybe (IO ()))))
   -> Application
 app index options middleware initial step
   = websocketsOr options (websocketApp initial step) (middleware backupApp)
@@ -123,13 +123,13 @@ app index options middleware initial step
 
 websocketApp :: forall st.
      st
-  -> (Context -> st -> IO (V.HTML, Event -> Maybe (IO ()), IO (Maybe st)))
+  -> (Context -> st -> IO (Maybe (V.HTML, st, Event -> Maybe (IO ()))))
   -> ServerApp
 websocketApp initial step pendingConn = do
-  conn  <- acceptRequest pendingConn
-  chan  <- newTVarIO Nothing
-  cf    <- newTVarIO Nothing
-  cbs   <- newIORef (0, M.empty)
+  conn <- acceptRequest pendingConn
+  chan <- newTVarIO Nothing
+  cf   <- newTVarIO Nothing
+  cbs  <- newIORef (0, M.empty)
 
   let ctx = Context
         { registerCallback = \cb -> atomicModifyIORef' cbs $ \(cbId, cbs') ->
@@ -186,26 +186,25 @@ websocketApp initial step pendingConn = do
 
     go :: Connection -> Context -> TVar (Maybe (Event -> Maybe (IO ()))) -> TVar (Maybe Int) -> Maybe V.HTML -> st -> Int -> IO ()
     go conn ctx chan cf oldDom st serverFrame = do
-      (newDom, fire, io) <- step ctx st
-
-      clientFrame <- atomically $ do
-        a <- readTVar cf
-        writeTVar cf Nothing
-        writeTVar chan (Just fire)
-        pure a
-
-      -- Throw exceptions here
-      newDom' <- evaluate newDom
-
-      case oldDom of
-        Nothing      -> do
-          sendTextData conn $ A.encode $ ReplaceDOM newDom'
-        Just oldDom' -> do
-          -- Throw exceptions here
-          diff <- evaluate (V.diff oldDom' newDom')
-          sendTextData conn $ A.encode $ UpdateDOM serverFrame clientFrame diff
-
-      r <- io
+      r <- step ctx st
       case r of
-        Nothing   -> pure ()
-        Just next -> go conn ctx chan cf (Just newDom) next (serverFrame + 1)
+        Nothing -> pure ()
+        Just (newDom, next, fire) -> do
+          clientFrame <- atomically $ do
+            a <- readTVar cf
+            writeTVar cf Nothing
+            pure a
+
+          -- Throw exceptions here
+          newDom' <- evaluate newDom
+
+          case oldDom of
+            Nothing      -> sendTextData conn $ A.encode $ ReplaceDOM newDom'
+            Just oldDom' -> do
+              -- Throw exceptions here
+              diff <- evaluate (V.diff oldDom' newDom')
+              sendTextData conn $ A.encode $ UpdateDOM serverFrame clientFrame diff
+
+          atomically $ writeTVar chan (Just fire)
+
+          go conn ctx chan cf (Just newDom) next (serverFrame + 1)
